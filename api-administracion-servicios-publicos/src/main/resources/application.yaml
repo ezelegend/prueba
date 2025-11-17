@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: api-administracion-servicios-publicos
+  profiles:
+    active: local  # Este es el perfil activo
+
+server:
+  port: 7097
+  servlet:
+    context-path: /api-administracion-servicios-publicos
+
+springdoc:
+  api-docs:
+    path: /api-docs
+
+
+api:
+  gestion-documentos:
+    url: https://apisix.local:32023/api-gestion-documentos
+
+
+siaper:
+  transversales:
+    url: http://localhost:7091
+
+
+
+
+

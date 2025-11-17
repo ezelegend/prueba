@@ -1,0 +1,50 @@
+spring:
+  datasource:
+    url: jdbc:oracle:thin:@172.30.22.123:1741/MBSIAP
+    username: siapertra
+    password: siapertra
+    driver-class-name: oracle.jdbc.OracleDriver
+  jpa:
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        envers:
+          enabled: false
+          autoRegisterListeners: false
+
+logging:
+  level:
+    root: INFO
+    cl.cgr.siaper.ru.api: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+
+api:
+  gestion-documentos:
+    url: http://localhost:7093/api-gestion-documentos
+  transversales:
+    url: http://localhost:7091/api-transversales
+
+config:
+  office_host: "172.30.20.99"
+  office_port: "8100"
+  keyCSV: "45686a486a486aadcdba84684767667658778950"
+  algorithmCSV: "XOR"
+  idAplicacion: "SIA"
+  footerBoxType: "9"
+  footerVerifyText: "Este documento está firmado electrónicamente, puede ser validado usando el código seguro de verificación accediendo a la siguiente dirección ##url####csv##"
+  footerVerifyUrl: "Este documento ha sido firmado electrónicamente de acuerdo con la ley N° 19.799"
+  logoServiceCGR: "/images/logoCGR.jpg"
+  logoServiceGeneral: "/images/logoServicios.jpg"
+  vistosconsiderandos: VISTOS:CONSIDERANDO
+
+firma:
+  masiva:
+    url:
+      validacion: https://siaper.contraloria.cl
+
+signer:
+  afirma5:
+    url:
+      validacion: https://siaper.contraloria.cl

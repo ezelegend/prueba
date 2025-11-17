@@ -1,0 +1,42 @@
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_SIAPERTRA_URL}
+    username: ${SPRING_DATASOURCE_SIAPERTRA_USERNAME}
+    password: ${SPRING_DATASOURCE_SIAPERTRA_PASSWORD}
+    driver-class-name: oracle.jdbc.OracleDriver
+  jpa:
+    hibernate:
+      ddl-auto: none
+
+logging:
+  level:
+    root: INFO
+    cl.cgr.siaper.ru.api: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+
+api:
+  gestion-documentos:
+    url: ${API_GESTION_DOCUMENTOS}
+
+config:
+  office_host: "172.30.20.99"
+  office_port: "8100"
+  keyCSV: "45686a486a486aadcdba84684767667658778950"
+  algorithmCSV: "XOR"
+  idAplicacion: "SIA"
+  footerBoxType: "9"
+  footerVerifyText: "Este documento está firmado electrónicamente, puede ser validado usando el código seguro de verificación accediendo a la siguiente dirección ##url####csv##"
+  footerVerifyUrl: "Este documento ha sido firmado electrónicamente de acuerdo con la ley N° 19.799"
+  logoServiceCGR: "/images/logoCGR.jpg"
+  logoServiceGeneral: "/images/logoServicios.jpg"
+
+firma:
+  masiva:
+    url:
+      validacion: https://siaper.contraloria.cl
+
+signer:
+  afirma5:
+    url:
+      validacion: https://siaper.contraloria.cl
