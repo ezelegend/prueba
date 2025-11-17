@@ -35,6 +35,7 @@ public class FirmanteCgr implements java.io.Serializable {
 	private Long calidadFirmante;
 	private Date version;
 	private Boolean activo;
+	private RuUsuario ruUsuario;  // FK to RU_USUARIOS for dual-write strategy
 	
 	public FirmanteCgr() {
 	}
@@ -98,5 +99,15 @@ public class FirmanteCgr implements java.io.Serializable {
 	
 	public void setActivo(Boolean activo) {
 		this.activo = activo;
+	}
+	
+	@ManyToOne(fetch = FetchType.LAZY)
+	@JoinColumn(name = "USUA_RU_X_USUA")
+	public RuUsuario getRuUsuario() {
+		return ruUsuario;
+	}
+	
+	public void setRuUsuario(RuUsuario ruUsuario) {
+		this.ruUsuario = ruUsuario;
 	}
 }

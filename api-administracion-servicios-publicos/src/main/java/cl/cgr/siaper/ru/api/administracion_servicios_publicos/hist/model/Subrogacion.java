@@ -39,6 +39,8 @@ public class Subrogacion implements java.io.Serializable {
 	private Date fechaInicio;
 	private Date fechaFin;
 	private Perfil perfil;
+	private RuUsuario ruUsuarioSubrogado;  // FK to RU_USUARIOS for dual-write strategy
+	private RuUsuario ruUsuarioSubrogante;  // FK to RU_USUARIOS for dual-write strategy
 		
 	public Subrogacion() {
 	}
@@ -154,6 +156,26 @@ public class Subrogacion implements java.io.Serializable {
 	 */
 	public void setPerfil(Perfil perfil) {
 		this.perfil = perfil;
+	}
+	
+	@ManyToOne(fetch = FetchType.LAZY)
+	@JoinColumn(name = "USUA_RU_X_USUA")
+	public RuUsuario getRuUsuarioSubrogado() {
+		return ruUsuarioSubrogado;
+	}
+	
+	public void setRuUsuarioSubrogado(RuUsuario ruUsuarioSubrogado) {
+		this.ruUsuarioSubrogado = ruUsuarioSubrogado;
+	}
+	
+	@ManyToOne(fetch = FetchType.LAZY)
+	@JoinColumn(name = "USUA_RU_X_USUA_S")
+	public RuUsuario getRuUsuarioSubrogante() {
+		return ruUsuarioSubrogante;
+	}
+	
+	public void setRuUsuarioSubrogante(RuUsuario ruUsuarioSubrogante) {
+		this.ruUsuarioSubrogante = ruUsuarioSubrogante;
 	}
 
 	public boolean equals(Object other) {
