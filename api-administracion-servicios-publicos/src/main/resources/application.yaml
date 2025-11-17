@@ -23,6 +23,15 @@ siaper:
   transversales:
     url: http://localhost:7091
 
+# Configuration for dual-write strategy and migration to RU_* tables
+usuarios:
+  source:
+    # Primary data source for read operations: TRA (legacy) or RU (new)
+    # - TRA: reads from TRA_USUARIOS and related tables (default, current behavior)
+    # - RU: reads from RU_USUARIOS and related tables (future state after migration)
+    # Write operations always perform dual-write to both TRA and RU tables
+    primary: TRA
+
 
 
 

@@ -19,6 +19,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -27,11 +28,46 @@ import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * Service implementation for user administration with dual-write strategy.
+ * 
+ * <p>This service implements a dual-write approach to support migration from TRA_* tables
+ * to RU_* tables. All write operations persist data to both table sets within the same
+ * transaction to ensure consistency.</p>
+ * 
+ * <h3>Dual-Write Strategy:</h3>
+ * <ul>
+ *   <li><b>saveUser():</b> Creates/updates users in both TRA_USUARIOS and RU_USUARIOS</li>
+ *   <li><b>profilesSave():</b> Synchronizes user profiles to both TRA_USUARIOS_X_PERFILES and RU_USUARIOS_PERFILES</li>
+ *   <li><b>metodosFirmaSave():</b> Synchronizes signing methods to both TRA_METODOS_FIRMA_RELACION and RU_METODOS_FIRMA_RELACION</li>
+ *   <li><b>activateByCodigo():</b> Updates active status in both TRA and RU tables</li>
+ *   <li><b>deactivateByCodigo():</b> Updates active status in both TRA and RU tables</li>
+ *   <li><b>changeServiceByCodigo():</b> Updates service assignment in both TRA and RU tables</li>
+ * </ul>
+ * 
+ * <h3>Migration Plan:</h3>
+ * <ol>
+ *   <li><b>Phase 1 (Current):</b> Dual-write to both TRA and RU tables, read from TRA (primary source)</li>
+ *   <li><b>Phase 2:</b> Verify data consistency between TRA and RU</li>
+ *   <li><b>Phase 3:</b> Switch primary read source to RU via usuarios.source.primary config</li>
+ *   <li><b>Phase 4:</b> Deactivate TRA as primary source, keep for legacy/audit</li>
+ * </ol>
+ * 
+ * <p>All dual-write operations are wrapped in @Transactional to guarantee atomicity.
+ * If any write to RU tables fails, the entire transaction is rolled back.</p>
+ * 
+ * @see RuUsuario
+ * @see RuUsuarioPerfil
+ * @see RuMetodoFirmaRelacion
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 @Transactional
 public class UsersAdminServiceImpl implements UsersAdminService {
+
+    @Value("${usuarios.source.primary:TRA}")
+    private String primarySource;
 
     private final Invoker invoker;
     private final ValidacionBean validacionBean;
@@ -49,6 +85,11 @@ public class UsersAdminServiceImpl implements UsersAdminService {
     private final FirmanteCgrConfigRepository firmanteCgrConfigRepo;
     private final AccesoEscritorioRepository accesoEscritorioRepo;
     private final TransversalesClient transversalesClient;
+
+    // RU repositories for dual-write
+    private final RuUsuarioRepository ruUsuarioRepo;
+    private final RuUsuarioPerfilRepository ruUsuarioPerfilRepo;
+    private final RuMetodoFirmaRelacionRepository ruMetodoFirmaRelacionRepo;
 
     @Override
     @Transactional(readOnly = true)
@@ -157,7 +198,8 @@ public class UsersAdminServiceImpl implements UsersAdminService {
         }
 
         try {
-            String runNormalized = req.getRunUser().trim().replaceAll("[\\.\\s]", "");
+            // Normalize RUN (remove dots and spaces)
+            String runNormalized = normalizeRun(req.getRunUser());
             validacionBean.validarRut(runNormalized);
 
             Usuario duplicated = usuarioRepo.findByRunOrCodigo(runNormalized, req.getCodUser()).orElse(null);
@@ -186,7 +228,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
             user.setNombre(req.getNameUser());
             user.setApellido1(req.getApe1User());
             user.setApellido2(req.getApe2User());
-            if (req.getEmail() != null) user.setEmail(req.getEmail());
+            // Only update email if provided (don't clear if null)
+            if (req.getEmail() != null) {
+                user.setEmail(req.getEmail());
+            }
             user.setConfigFirma(req.getConfigHSM());
             user.setConfigFirmaPDF(req.getConfigHSMPDF());
             user.setUsuarioConfigFirma(req.getUsuarioFirmante());
@@ -208,7 +253,12 @@ public class UsersAdminServiceImpl implements UsersAdminService {
 
             user.setServicio(servicioSelect);
 
+            // Save to TRA_USUARIOS
             user = usuarioRepo.save(user);
+            log.debug("Saved Usuario id={} to TRA_USUARIOS", user.getId());
+
+            // Dual-write: sync to RU_USUARIOS
+            syncUsuarioToRu(user);
 
             validaCalidadFirmante(user, Boolean.TRUE.equals(req.isCheckFirmante()), req.getCalidadFirmante());
 
@@ -221,6 +271,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
                     mtr.setClaveAleatoria(random);
                     mtr.setFirmaUnica(!random);
                     metodoFirmaRelacionRepo.save(mtr);
+                    
+                    // Dual-write: sync HSM config to RU
+                    List<MetodoFirmaRelacion> currentMethods = metodoFirmaRelacionRepo.findByUsuarioIdAndServicioId(user.getId(), servicioSelect.getId());
+                    syncMetodosFirmaToRu(user, servicioSelect, currentMethods);
                 }
             }
 
@@ -269,6 +323,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
 
                     metodoFirmaRelacionRepo.save(nueva);
                 }
+                
+                // Dual-write: sync all signing methods to RU
+                List<MetodoFirmaRelacion> finalMethods = metodoFirmaRelacionRepo.findByUsuarioIdAndServicioId(user.getId(), servicioSelect.getId());
+                syncMetodosFirmaToRu(user, servicioSelect, finalMethods);
             }
 
             return buildDetails(user);
@@ -282,6 +340,11 @@ public class UsersAdminServiceImpl implements UsersAdminService {
         Usuario u = usuarioRepo.findByCodigo(codigo).orElseThrow(() -> new IllegalArgumentException("Usuario no encontrado"));
         u.setActivo(true);
         usuarioRepo.save(u);
+        log.debug("Activated Usuario codigo={} in TRA", codigo);
+        
+        // Dual-write: update RU_USUARIOS
+        syncUsuarioToRu(u);
+        
         validaCalidadFirmante(u, true, null);
     }
 
@@ -291,6 +354,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
                 .orElseThrow(() -> new IllegalArgumentException("Usuario no encontrado"));
         u.setActivo(false);
         usuarioRepo.save(u);
+        log.debug("Deactivated Usuario codigo={} in TRA", codigo);
+        
+        // Dual-write: update RU_USUARIOS
+        syncUsuarioToRu(u);
     }
 
     @Override
@@ -299,6 +366,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
         Servicio serv = resolveService(serviceId);
         u.setServicio(serv);
         usuarioRepo.save(u);
+        log.debug("Changed service for Usuario codigo={} to serviceId={} in TRA", codigo, serviceId);
+
+        // Dual-write: update service in RU_USUARIOS
+        syncUsuarioToRu(u);
 
         boolean checkFirmante = isFirmanteOrFirmanteCgr(u) && isContraloria(serv);
         if (checkFirmante) {
@@ -384,6 +455,11 @@ public class UsersAdminServiceImpl implements UsersAdminService {
 
         if (!aAgregar.isEmpty()) usuarioPerfilRepo.saveAll(aAgregar);
         if (!aEliminar.isEmpty()) usuarioPerfilRepo.deleteAll(aEliminar);
+        
+        log.debug("Saved profiles for Usuario codigo={} in TRA", req.getCodigo());
+
+        // Dual-write: sync profiles to RU_USUARIOS_PERFILES
+        syncPerfilesToRu(user, nuevos);
 
         boolean verServicioVU = nuevos.stream().anyMatch(p ->
                 Constantes.GESTOR.equals(p.getNombre()) || Constantes.FIRMANTE_ESTAMPA.equals(p.getNombre()));
@@ -511,6 +587,11 @@ public class UsersAdminServiceImpl implements UsersAdminService {
         if (metodoIds.isEmpty()) {
             metodoFirmaRelacionRepo.findByUsuarioIdAndServicioId(user.getId(), serv.getId())
                     .forEach(metodoFirmaRelacionRepo::delete);
+            log.debug("Deleted all metodos firma for Usuario codigo={} in TRA", req.getCodigo());
+            
+            // Dual-write: clear RU signing methods
+            syncMetodosFirmaToRu(user, serv, Collections.emptyList());
+            
             return buildDetails(user);
         }
 
@@ -546,6 +627,12 @@ public class UsersAdminServiceImpl implements UsersAdminService {
                 metodoFirmaRelacionRepo.save(mtr);
             }
         }
+        
+        log.debug("Saved metodos firma for Usuario codigo={} in TRA", req.getCodigo());
+
+        // Dual-write: sync all signing methods to RU
+        List<MetodoFirmaRelacion> finalMethods = metodoFirmaRelacionRepo.findByUsuarioIdAndServicioId(user.getId(), serv.getId());
+        syncMetodosFirmaToRu(user, serv, finalMethods);
 
         return buildDetails(user);
     }
@@ -624,6 +711,10 @@ public class UsersAdminServiceImpl implements UsersAdminService {
         fc.setServicioFirmante(user.getServicio());
         fc.setUsuarioFirmanteCgr(user);
         fc.setVersion(new Date());
+        
+        // Update RU reference
+        updateFirmanteCgrRuReference(fc, user);
+        
         firmanteCgrRepo.save(fc);
     }
 
@@ -637,6 +728,9 @@ public class UsersAdminServiceImpl implements UsersAdminService {
                 if (calidadFirmante != null) {
                     f.setCalidadFirmante(Long.valueOf(calidadFirmante));
                 }
+                // Update RU reference
+                updateFirmanteCgrRuReference(f, user);
+                
                 firmanteCgrRepo.save(f);
                 firmantesConfig = firmanteCgrConfigRepo.findByFirmanteId(f.getId());
             }
@@ -746,5 +840,223 @@ public class UsersAdminServiceImpl implements UsersAdminService {
     private List<String[]> buscarSiaperServicioWeb(String idServicioWeb, String[] args) throws InvokerException {
         InvokerResponse response = invoker.invoke(idServicioWeb, args);
         return response.getStringList();
+    }
+
+    // =================== Dual-Write Helper Methods ===================
+
+    /**
+     * Normalizes RUN by removing dots and spaces.
+     * Example: "12.345.678-9" becomes "12345678-9"
+     */
+    private String normalizeRun(String run) {
+        if (run == null) return null;
+        return run.trim().replaceAll("[\\.\\s]", "");
+    }
+
+    /**
+     * Synchronizes a Usuario to RuUsuario (dual-write for user data).
+     * Creates or updates RuUsuario based on the Usuario's codigo.
+     */
+    private void syncUsuarioToRu(Usuario usuario) {
+        if (usuario == null || usuario.getCodigo() == null) {
+            log.warn("Cannot sync null usuario or usuario without codigo to RU");
+            return;
+        }
+
+        try {
+            log.debug("Dual-write: syncing Usuario {} to RuUsuario", usuario.getCodigo());
+            
+            RuUsuario ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo()).orElse(null);
+            boolean isNew = (ruUsuario == null);
+            
+            if (isNew) {
+                ruUsuario = new RuUsuario();
+                log.debug("Dual-write: creating new RuUsuario for codigo {}", usuario.getCodigo());
+            } else {
+                log.debug("Dual-write: updating existing RuUsuario id={} for codigo {}", ruUsuario.getId(), usuario.getCodigo());
+            }
+
+            // Sync all fields from Usuario to RuUsuario
+            ruUsuario.setCodigo(usuario.getCodigo());
+            ruUsuario.setRun(usuario.getRun());
+            ruUsuario.setNombre(usuario.getNombre());
+            ruUsuario.setApellido1(usuario.getApellido1());
+            ruUsuario.setApellido2(usuario.getApellido2());
+            ruUsuario.setOrigen(usuario.getOrigen());
+            ruUsuario.setActivo(usuario.getActivo());
+            ruUsuario.setCodUsuarioBloq(usuario.getCodUsuarioBloq());
+            ruUsuario.setEmail(usuario.getEmail());
+            ruUsuario.setConfigFirma(usuario.getConfigFirma());
+            ruUsuario.setConfigFirmaPDF(usuario.getConfigFirmaPDF());
+            ruUsuario.setUsuarioConfigFirma(usuario.getUsuarioConfigFirma());
+            ruUsuario.setServicio(usuario.getServicio());
+
+            ruUsuarioRepo.save(ruUsuario);
+            log.debug("Dual-write: RuUsuario saved successfully with id={}", ruUsuario.getId());
+
+        } catch (Exception e) {
+            log.error("Dual-write FAILED: error syncing Usuario {} to RuUsuario - rolling back transaction", usuario.getCodigo(), e);
+            throw new RuntimeException("Dual-write to RU_USUARIOS failed for user: " + usuario.getCodigo(), e);
+        }
+    }
+
+    /**
+     * Synchronizes user profiles from TRA to RU tables.
+     * Deletes all existing RU profiles for the user and recreates them based on current TRA profiles.
+     */
+    private void syncPerfilesToRu(Usuario usuario, List<Perfil> perfiles) {
+        if (usuario == null || usuario.getCodigo() == null) {
+            log.warn("Cannot sync profiles: usuario is null or has no codigo");
+            return;
+        }
+
+        try {
+            log.debug("Dual-write: syncing profiles for Usuario {} to RU", usuario.getCodigo());
+            
+            RuUsuario ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo()).orElse(null);
+            if (ruUsuario == null) {
+                log.warn("Dual-write: RuUsuario not found for codigo {}. Creating RuUsuario first.", usuario.getCodigo());
+                syncUsuarioToRu(usuario);
+                ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo())
+                        .orElseThrow(() -> new RuntimeException("Failed to create RuUsuario for profile sync"));
+            }
+
+            // Delete existing RU profiles
+            List<RuUsuarioPerfil> existingRuProfiles = ruUsuarioPerfilRepo.findByRuUsuarioId(ruUsuario.getId());
+            if (!existingRuProfiles.isEmpty()) {
+                log.debug("Dual-write: deleting {} existing RU profiles for user {}", existingRuProfiles.size(), usuario.getCodigo());
+                ruUsuarioPerfilRepo.deleteAll(existingRuProfiles);
+            }
+
+            // Create new RU profiles
+            for (Perfil perfil : perfiles) {
+                RuUsuarioPerfil ruPerfil = new RuUsuarioPerfil();
+                ruPerfil.setRuUsuario(ruUsuario);
+                ruPerfil.setPerfil(perfil);
+                ruUsuarioPerfilRepo.save(ruPerfil);
+            }
+            
+            log.debug("Dual-write: synced {} profiles to RU for user {}", perfiles.size(), usuario.getCodigo());
+
+        } catch (Exception e) {
+            log.error("Dual-write FAILED: error syncing profiles for Usuario {} to RU - rolling back transaction", usuario.getCodigo(), e);
+            throw new RuntimeException("Dual-write to RU_USUARIOS_PERFILES failed for user: " + usuario.getCodigo(), e);
+        }
+    }
+
+    /**
+     * Synchronizes signing methods from TRA to RU tables.
+     * Maintains the same relationships for signing methods in RU_METODOS_FIRMA_RELACION.
+     */
+    private void syncMetodosFirmaToRu(Usuario usuario, Servicio servicio, List<MetodoFirmaRelacion> metodosFirmaTra) {
+        if (usuario == null || usuario.getCodigo() == null || servicio == null) {
+            log.warn("Cannot sync metodos firma: invalid parameters");
+            return;
+        }
+
+        try {
+            log.debug("Dual-write: syncing metodos firma for Usuario {} to RU", usuario.getCodigo());
+            
+            RuUsuario ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo()).orElse(null);
+            if (ruUsuario == null) {
+                log.warn("Dual-write: RuUsuario not found for codigo {}. Creating RuUsuario first.", usuario.getCodigo());
+                syncUsuarioToRu(usuario);
+                ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo())
+                        .orElseThrow(() -> new RuntimeException("Failed to create RuUsuario for metodo firma sync"));
+            }
+
+            // Get existing RU signing methods
+            List<RuMetodoFirmaRelacion> existingRu = ruMetodoFirmaRelacionRepo.findByRuUsuarioIdAndServicioId(ruUsuario.getId(), servicio.getId());
+            
+            // Build map of current TRA methods
+            Map<Long, MetodoFirmaRelacion> traMap = metodosFirmaTra.stream()
+                    .filter(mfr -> mfr.getMetodoFirma() != null)
+                    .collect(Collectors.toMap(mfr -> mfr.getMetodoFirma().getId(), Function.identity()));
+
+            // Delete RU methods that no longer exist in TRA
+            for (RuMetodoFirmaRelacion ruMf : existingRu) {
+                if (ruMf.getMetodoFirma() != null && !traMap.containsKey(ruMf.getMetodoFirma().getId())) {
+                    log.debug("Dual-write: deleting RU metodo firma {} for user {}", ruMf.getMetodoFirma().getCodigo(), usuario.getCodigo());
+                    ruMetodoFirmaRelacionRepo.delete(ruMf);
+                }
+            }
+
+            // Create or update RU methods to match TRA
+            Map<Long, RuMetodoFirmaRelacion> ruMap = existingRu.stream()
+                    .filter(mfr -> mfr.getMetodoFirma() != null)
+                    .collect(Collectors.toMap(mfr -> mfr.getMetodoFirma().getId(), Function.identity()));
+
+            for (MetodoFirmaRelacion traMf : metodosFirmaTra) {
+                if (traMf.getMetodoFirma() == null) continue;
+                
+                Long metodoId = traMf.getMetodoFirma().getId();
+                RuMetodoFirmaRelacion ruMf = ruMap.get(metodoId);
+                
+                if (ruMf == null) {
+                    // Create new RU method
+                    RuMetodoFirmaRelacionPK pk = new RuMetodoFirmaRelacionPK(ruUsuario.getId(), servicio.getId(), metodoId);
+                    ruMf = new RuMetodoFirmaRelacion(pk, traMf.isClaveAleatoria(), traMf.isFirmaUnica(), 
+                            ruUsuario, servicio, traMf.getMetodoFirma());
+                    log.debug("Dual-write: creating RU metodo firma {} for user {}", traMf.getMetodoFirma().getCodigo(), usuario.getCodigo());
+                } else {
+                    // Update existing RU method
+                    ruMf.setClaveAleatoria(traMf.isClaveAleatoria());
+                    ruMf.setFirmaUnica(traMf.isFirmaUnica());
+                    log.debug("Dual-write: updating RU metodo firma {} for user {}", traMf.getMetodoFirma().getCodigo(), usuario.getCodigo());
+                }
+                
+                ruMetodoFirmaRelacionRepo.save(ruMf);
+            }
+            
+            log.debug("Dual-write: synced {} metodos firma to RU for user {}", metodosFirmaTra.size(), usuario.getCodigo());
+
+        } catch (Exception e) {
+            log.error("Dual-write FAILED: error syncing metodos firma for Usuario {} to RU - rolling back transaction", usuario.getCodigo(), e);
+            throw new RuntimeException("Dual-write to RU_METODOS_FIRMA_RELACION failed for user: " + usuario.getCodigo(), e);
+        }
+    }
+
+    /**
+     * Updates FK references in FirmanteCgr to point to RuUsuario when available.
+     */
+    private void updateFirmanteCgrRuReference(FirmanteCgr firmante, Usuario usuario) {
+        if (firmante == null || usuario == null) return;
+        
+        try {
+            RuUsuario ruUsuario = ruUsuarioRepo.findByCodigo(usuario.getCodigo()).orElse(null);
+            if (ruUsuario != null) {
+                firmante.setRuUsuario(ruUsuario);
+                log.debug("Dual-write: linked FirmanteCgr id={} to RuUsuario id={}", firmante.getId(), ruUsuario.getId());
+            } else {
+                // Set to null (or -1 if schema requires it, but NULL is preferred)
+                firmante.setRuUsuario(null);
+                log.debug("Dual-write: FirmanteCgr id={} - RuUsuario not found for codigo {}, setting FK to NULL", firmante.getId(), usuario.getCodigo());
+            }
+        } catch (Exception e) {
+            log.warn("Failed to update FirmanteCgr RU reference for usuario {}", usuario.getCodigo(), e);
+        }
+    }
+
+    /**
+     * Updates FK references in Subrogacion to point to RuUsuario when available.
+     */
+    private void updateSubrogacionRuReferences(Subrogacion subrogacion) {
+        if (subrogacion == null) return;
+        
+        try {
+            if (subrogacion.getUsuarioSubrogado() != null && subrogacion.getUsuarioSubrogado().getCodigo() != null) {
+                RuUsuario ruSubrogado = ruUsuarioRepo.findByCodigo(subrogacion.getUsuarioSubrogado().getCodigo()).orElse(null);
+                subrogacion.setRuUsuarioSubrogado(ruSubrogado);
+            }
+            
+            if (subrogacion.getUsuarioSubrogante() != null && subrogacion.getUsuarioSubrogante().getCodigo() != null) {
+                RuUsuario ruSubrogante = ruUsuarioRepo.findByCodigo(subrogacion.getUsuarioSubrogante().getCodigo()).orElse(null);
+                subrogacion.setRuUsuarioSubrogante(ruSubrogante);
+            }
+            
+            log.debug("Dual-write: updated Subrogacion id={} RU references", subrogacion.getId());
+        } catch (Exception e) {
+            log.warn("Failed to update Subrogacion RU references for subrogacion id={}", subrogacion.getId(), e);
+        }
     }
 }
